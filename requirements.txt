@@ -1,9 +1,11 @@
 streamlit
+streamlit-autorefresh
 yfinance
 pandas
 numpy
 scikit-learn
-GoogleNews
-transformers
 torch
+transformers
+GoogleNews
 plotly
+pytz
