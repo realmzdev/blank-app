@@ -4,6 +4,7 @@ import streamlit as st
 from datetime import datetime, time as dtime
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error
+from streamlit_autorefresh import st_autorefresh
 
 # Safe import for transformers pipeline
 try:
@@ -14,8 +15,8 @@ import torch
 
 warnings.filterwarnings("ignore")
 st.set_page_config(page_title="Real-Time 10-Minute Stock Forecast", layout="centered")
-st.title("⏱️ Real-Time 10-Minute Stock Forecast")
-st.caption("Predicts next 10-minute return using intraday (1-min) data. Not financial advice.")
+st.title("⏱️ Real-Time Stock Forecast")
+st.caption("Predicts next return using intraday (1-min) data. Not financial advice.")
 
 # ---------- Persistent Ticker ----------
 if "ticker" not in st.session_state:
@@ -153,10 +154,8 @@ else:
     st.caption("Validation window too small.")
 
 # ---------- Live Forecast (auto-updating every 15s) ----------
-from streamlit_autorefresh import st_autorefresh
-
 # reruns script (not reloads page) every 15 seconds
-st_autorefresh(interval=5 * 1000, key="forecast_refresh")
+st_autorefresh(interval=10 * 1000, key="forecast_refresh")
 
 def signal_from_ret(r):
     if r >= 0.004:
@@ -170,7 +169,7 @@ def signal_from_ret(r):
     else:
         return "🔴 Strong Sell"
 
-st.subheader(f"Live 10-Minute Forecast • {ticker}")
+st.subheader(f"Live Forecast • {ticker}")
 c1, c2, c3 = st.columns(3)
 signal_box = st.empty()
 
@@ -194,8 +193,8 @@ else:
         color = "green" if "Buy" in signal else "red" if "Sell" in signal else "gray"
 
         c1.metric("Last Price", f"${live_close:.2f}")
-        c2.metric("Predicted 10-min Return", f"{pred_ret:+.3%}")
-        c3.metric("Implied Price in ~10 min", f"${pred_price:.2f}")
+        c2.metric("Predicted Return", f"{pred_ret:+.3%}")
+        c3.metric("Implied Price", f"${pred_price:.2f}")
         signal_box.markdown(f"<h3 style='color:{color}'>{signal}</h3>", unsafe_allow_html=True)
 
     except Exception as e:
