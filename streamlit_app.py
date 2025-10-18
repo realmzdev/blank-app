@@ -1,4 +1,3 @@
-# streamlit run intraday_10m_forecast.py
 import warnings, numpy as np, pandas as pd, yfinance as yf, time, pytz
 import streamlit as st
 from datetime import datetime, time as dtime
@@ -71,12 +70,7 @@ def in_market_hours(ts, tz="America/New_York"):
     return (local.weekday() < 5) and (hour >= 9.5) and (hour <= 16.0)
 
 def market_open_now():
-    ny = datetime.now(pytz.timezone("America/New_York"))
-    weekday = ny.weekday()
-    now_time = ny.time()
-    if weekday >= 5:
-        return False
-    return dtime(9,30) <= now_time <= dtime(16,0)
+    return True
 
 @st.cache_resource(show_spinner=False)
 def get_sentiment_model():
@@ -88,8 +82,8 @@ st.write(f"⬇️ Downloading 1-minute data for **{ticker}** (last 7 days)…")
 try:
     data = yf.download(
         tickers=ticker,
-        period="7d",
-        interval="1m",
+        period="2d",
+        interval="15m",
         auto_adjust=True,
         prepost=use_prepost,
         progress=False
@@ -138,10 +132,11 @@ y_valid = fx_recent["target"].iloc[split_idx:]
 
 st.write("🤖 Training Gradient Boosting model…")
 model = GradientBoostingRegressor(
-    n_estimators=600,
-    max_depth=3,
-    learning_rate=0.03,
-    subsample=0.9,
+    n_estimators=800,        # more estimators for stability
+    max_depth=4,             # allow more complex regimes
+    learning_rate=0.015,     # slower learning for less overshoot
+    min_samples_split=5,
+    subsample=0.8,           # inject randomness
     random_state=int(random_state)
 )
 model.fit(X_train, y_train)

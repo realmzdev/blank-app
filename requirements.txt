@@ -7,5 +7,4 @@ scikit-learn
 torch
 transformers
 GoogleNews
-plotly
 pytz
