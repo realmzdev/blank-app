@@ -70,7 +70,12 @@ def in_market_hours(ts, tz="America/New_York"):
     return (local.weekday() < 5) and (hour >= 9.5) and (hour <= 16.0)
 
 def market_open_now():
-    return True
+    ny = datetime.now(pytz.timezone("America/New_York"))
+    weekday = ny.weekday()
+    now_time = ny.time()
+    if weekday >= 5:
+        return False
+    return dtime(9,30) <= now_time <= dtime(16,0)
 
 @st.cache_resource(show_spinner=False)
 def get_sentiment_model():
