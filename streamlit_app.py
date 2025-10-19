@@ -82,8 +82,8 @@ st.write(f"⬇️ Downloading 1-minute data for **{ticker}** (last 7 days)…")
 try:
     data = yf.download(
         tickers=ticker,
-        period="2d",
-        interval="15m",
+        period="7d",
+        interval="1m",
         auto_adjust=True,
         prepost=use_prepost,
         progress=False
@@ -132,11 +132,10 @@ y_valid = fx_recent["target"].iloc[split_idx:]
 
 st.write("🤖 Training Gradient Boosting model…")
 model = GradientBoostingRegressor(
-    n_estimators=800,        # more estimators for stability
-    max_depth=4,             # allow more complex regimes
-    learning_rate=0.015,     # slower learning for less overshoot
-    min_samples_split=5,
-    subsample=0.8,           # inject randomness
+    n_estimators=600,
+    max_depth=3,
+    learning_rate=0.03,
+    subsample=0.9,
     random_state=int(random_state)
 )
 model.fit(X_train, y_train)
