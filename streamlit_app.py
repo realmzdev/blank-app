@@ -5,6 +5,7 @@ from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error
 from transformers import pipeline
 import torch
+from streamlit_autorefresh import st_autorefresh
 
 warnings.filterwarnings("ignore")
 st.set_page_config(page_title="Real-Time 10-Minute Stock Forecast", layout="centered")
@@ -31,10 +32,7 @@ with st.expander("Advanced"):
     use_sentiment = st.checkbox("Use FinBERT sentiment (slower)", value=False)
     random_state = st.number_input("Random state", min_value=0, value=42, step=1)
 
-# ---- Auto Refresh (works on all Streamlit versions) ----
-st.markdown(f"""
-    <meta http-equiv="refresh" content="{refresh_secs}">
-""", unsafe_allow_html=True)
+
 
 # ---------- Helper Functions ----------
 def rsi(series, window=14):
@@ -147,6 +145,7 @@ else:
     st.caption("Validation window too small.")
 
 # ---------- Live Prediction ----------
+st_autorefresh(interval=10 * 1000, key="forecast_refresh")
 latest_row = fx_recent.iloc[[-1]][X_cols]
 pred_ret = float(model.predict(latest_row)[0])
 live_close = float(reg["Close"].iloc[-1])
