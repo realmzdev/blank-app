@@ -32,8 +32,9 @@ with st.expander("Advanced"):
     random_state = st.number_input("Random state", min_value=0, value=42, step=1)
 
 # ---------- Helper functions ----------
+# ---------- Helper Functions ----------
 def tom(series, window=9):
-    """Typical Oscillator Momentum"""
+    """Typical Oscillator Momentum (TOM) = normalized price position in rolling range."""
     roll_min = series.rolling(window=window).min()
     roll_max = series.rolling(window=window).max()
     tom_val = 100 * (series - roll_min) / (roll_max - roll_min)
@@ -47,7 +48,8 @@ def make_minute_features(df):
     out["hl_spread"] = (out["High"] - out["Low"]) / out["Close"]
     out["vol_10"] = out["ret_1"].rolling(10).std()
     out["vol_30"] = out["ret_1"].rolling(30).std()
-    out["tom_9"]  = tom(out["Close"], 9)
+    out["tom_9"]  = tom(out["Close"], 9)     # ⬅️ replaces RSI(14)
+
     for col in ["ret_1","ret_5","ret_10","vol_10","vol_30","tom_9","hl_spread"]:
         out[f"{col}_lag1"]  = out[col].shift(1)
         out[f"{col}_lag5"]  = out[col].shift(5)
