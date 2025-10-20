@@ -1,17 +1,28 @@
-# streamlit run intraday_10m_forecast.py
+# streamlit run intraday_10m_forecast_live.py
 import warnings, numpy as np, pandas as pd, yfinance as yf
 import streamlit as st
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error
 from transformers import pipeline
 import torch
+import time
 
 warnings.filterwarnings("ignore")
+
+# === Auto update every 10s without page reload ===
+if "last_update" not in st.session_state:
+    st.session_state["last_update"] = 0
+now = time.time()
+if now - st.session_state["last_update"] > 10:
+    st.session_state["last_update"] = now
+    st.rerun()
+
+# ---------- Streamlit UI ----------
 st.set_page_config(page_title="Real-Time 10-Minute Stock Forecast", layout="centered")
 st.title("⏱️ Real-Time 10-Minute Stock Forecast")
 st.caption("Predicts next 10-minute return using intraday (1-min) data. Not financial advice.")
 
-# ---------- Persistent Ticker ----------
+# ---------- Persistent ticker ----------
 if "ticker" not in st.session_state:
     st.session_state["ticker"] = "AAPL"
 
@@ -21,20 +32,14 @@ if ticker_input and ticker_input != st.session_state["ticker"]:
     st.session_state["ticker"] = ticker_input
 
 ticker = st.session_state["ticker"]
-
 train_days = col2.slider("Training window (days of 1-min bars)", 1, 5, 3)
 target_horizon_min = col3.number_input("Forecast horizon (minutes)", min_value=5, max_value=30, value=10, step=5)
 
 with st.expander("Advanced"):
     use_prepost = st.checkbox("Include pre/post market", value=False)
-    refresh_secs = st.number_input("Auto-refresh every (seconds)", min_value=30, max_value=300, value=60, step=10)
+    refresh_secs = st.number_input("Auto-refresh every (seconds)", min_value=10, max_value=300, value=10, step=10)
     use_sentiment = st.checkbox("Use FinBERT sentiment (slower)", value=False)
     random_state = st.number_input("Random state", min_value=0, value=42, step=1)
-
-# ---- Auto Refresh (works on all Streamlit versions) ----
-st.markdown(f"""
-    <meta http-equiv="refresh" content="{refresh_secs}">
-""", unsafe_allow_html=True)
 
 # ---------- Helper Functions ----------
 def rsi(series, window=14):
@@ -174,9 +179,9 @@ c2.metric("Predicted 10-min Return", f"{pred_ret:+.3%}")
 c3.metric("Implied Price in ~10 min", f"${pred_price:.2f}")
 
 st.markdown(f"<h3 style='color:{color}'>{signal}</h3>", unsafe_allow_html=True)
-st.caption(f"Auto-refreshes every {refresh_secs} seconds — ticker stays saved.")
+st.caption(f"Auto-updates every 10 seconds without reloading or losing ticker.")
 
-# ---------- Simple Backtest ----------
+# ---------- Backtest ----------
 with st.expander("Show simple walk-forward backtest (last session)"):
     last_day = fx_recent.index.date[-1]
     mask = pd.Series(fx_recent.index.date == last_day, index=fx_recent.index)
