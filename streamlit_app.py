@@ -1,5 +1,5 @@
-# intraday_live_forecast.py
-# Run with: streamlit run intraday_live_forecast.py
+# intraday_live_forecast_fixed.py
+# Run with: streamlit run intraday_live_forecast_fixed.py
 
 import warnings, numpy as np, pandas as pd, yfinance as yf, pytz
 import streamlit as st
@@ -122,7 +122,6 @@ if data.empty:
 data = data.dropna().copy()
 data.index = data.index.tz_localize("UTC") if data.index.tz is None else data.index.tz_convert("UTC")
 
-# Use full dataset; intraday-only logic can vary by region
 reg = data.copy()
 
 # ---------- Feature Engineering ----------
@@ -138,7 +137,7 @@ if fx_recent.empty:
     st.error("Not enough data for training.")
     st.stop()
 
-fx_recent["sentiment"] = 0.0  # placeholder for FinBERT integration
+fx_recent["sentiment"] = 0.0
 
 # ---------- Model Training ----------
 split_idx = int(len(fx_recent) * 0.8)
@@ -192,10 +191,18 @@ try:
     # Inject live price into latest candle for feature recomputation
     latest_df = reg.copy()
     latest_df.iloc[-1, latest_df.columns.get_loc("Close")] = live_close
+
+    # Recalculate features with this updated price
     fx_live = make_minute_features(latest_df).iloc[[-1]]
     fx_live["sentiment"] = 0.0
-    fx_live = fx_live[X_cols].fillna(method="ffill").fillna(0)
 
+    # --- ✅ Align columns safely with training features ---
+    for col in X_cols:
+        if col not in fx_live.columns:
+            fx_live[col] = 0.0
+    fx_live = fx_live[X_cols].fillna(0)
+
+    # Predict using live-adjusted data
     pred_ret = float(model.predict(fx_live)[0])
     pred_price = live_close * (1 + pred_ret)
 
