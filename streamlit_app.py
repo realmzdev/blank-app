@@ -199,4 +199,4 @@ else:
     except Exception as e:
         signal_box.error(f"⚠️ Live update error: {e}")
 
-st.caption("⚡ Auto-updates forecast every 15 seconds without page reload."), I want 5-10 minutes forecasts that are accurate and I trade when market is open
+st.caption("⚡ Auto-updates forecast every 15 seconds without page reload.")
