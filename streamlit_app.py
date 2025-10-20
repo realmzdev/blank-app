@@ -1,16 +1,9 @@
-# intraday_10m_forecast.py
-# Run with: streamlit run intraday_10m_forecast.py
-
-import warnings, numpy as np, pandas as pd, yfinance as yf, time, pytz
+# streamlit run intraday_10m_forecast.py
+import warnings, numpy as np, pandas as pd, yfinance as yf
 import streamlit as st
-from datetime import datetime
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error
-
-try:
-    from transformers import pipeline
-except ImportError:
-    from transformers.pipelines import pipeline
+from transformers import pipeline
 import torch
 
 warnings.filterwarnings("ignore")
@@ -26,6 +19,7 @@ col1, col2, col3 = st.columns(3)
 ticker_input = col1.text_input("Symbol", st.session_state["ticker"]).upper().strip()
 if ticker_input and ticker_input != st.session_state["ticker"]:
     st.session_state["ticker"] = ticker_input
+
 ticker = st.session_state["ticker"]
 
 train_days = col2.slider("Training window (days of 1-min bars)", 1, 5, 3)
@@ -33,8 +27,14 @@ target_horizon_min = col3.number_input("Forecast horizon (minutes)", min_value=5
 
 with st.expander("Advanced"):
     use_prepost = st.checkbox("Include pre/post market", value=False)
+    refresh_secs = st.number_input("Auto-refresh every (seconds)", min_value=30, max_value=300, value=60, step=10)
     use_sentiment = st.checkbox("Use FinBERT sentiment (slower)", value=False)
     random_state = st.number_input("Random state", min_value=0, value=42, step=1)
+
+# ---- Auto Refresh (works on all Streamlit versions) ----
+st.markdown(f"""
+    <meta http-equiv="refresh" content="{refresh_secs}">
+""", unsafe_allow_html=True)
 
 # ---------- Helper Functions ----------
 def rsi(series, window=14):
@@ -44,7 +44,8 @@ def rsi(series, window=14):
     roll_up = up.ewm(alpha=1/window, adjust=False).mean()
     roll_down = down.ewm(alpha=1/window, adjust=False).mean()
     rs = roll_up / roll_down.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+    rsi_val = 100 - (100 / (1 + rs))
+    return rsi_val.fillna(50)
 
 def make_minute_features(df):
     out = df.copy()
@@ -65,42 +66,15 @@ def make_minute_features(df):
     out["dow"]    = idx.dayofweek
     return out
 
-def get_live_price(ticker):
-    """Try multiple methods to get a true live price from Yahoo."""
-    tk = yf.Ticker(ticker)
-    # Try fast_info first
-    try:
-        fi = tk.fast_info
-        if hasattr(fi, "last_price") and fi.last_price:
-            return float(fi.last_price)
-        if hasattr(fi, "regularMarketPrice") and fi.regularMarketPrice:
-            return float(fi.regularMarketPrice)
-    except Exception:
-        pass
-
-    # Try .info as fallback
-    try:
-        info = tk.info
-        for key in ["regularMarketPrice", "currentPrice", "bid", "ask"]:
-            if key in info and info[key] is not None and info[key] > 0:
-                return float(info[key])
-    except Exception:
-        pass
-
-    # Last resort: last 1m bar
-    try:
-        hist = tk.history(period="1d", interval="1m", auto_adjust=True)
-        if not hist.empty:
-            return float(hist["Close"].iloc[-1])
-    except Exception:
-        pass
-
-    return np.nan
-
 @st.cache_resource(show_spinner=False)
 def get_sentiment_model():
     device = 0 if torch.cuda.is_available() else -1
     return pipeline("sentiment-analysis", model="ProsusAI/finbert", device=device)
+
+def in_market_hours(ts, tz="America/New_York"):
+    local = ts.tz_convert(tz)
+    hour = local.hour + local.minute/60.0
+    return (local.weekday() < 5) and (hour >= 9.5) and (hour <= 16.0)
 
 # ---------- Data Download ----------
 st.write(f"⬇️ Downloading 1-minute data for **{ticker}** (last 7 days)…")
@@ -124,7 +98,12 @@ if data.empty:
 data = data.dropna().copy()
 data.index = data.index.tz_localize("UTC") if data.index.tz is None else data.index.tz_convert("UTC")
 
-reg = data.copy()
+reg = data[data.index.map(in_market_hours)]
+if len(reg) < 500:
+    st.info("Little regular-hours data; using all data (incl. pre/post).")
+    reg = data
+
+# ---------- Feature Engineering ----------
 h = int(target_horizon_min)
 reg["future_ret_h"] = reg["Close"].shift(-h) / reg["Close"] - 1.0
 cut_time = reg.index.max() - pd.Timedelta(days=int(train_days))
@@ -167,9 +146,11 @@ if len(X_valid) >= 50:
 else:
     st.caption("Validation window too small.")
 
-# ---------- Live Forecast (auto-updating every 15s) ----------
-from streamlit_autorefresh import st_autorefresh
-st_autorefresh(interval=15 * 1000, key="forecast_refresh")
+# ---------- Live Prediction ----------
+latest_row = fx_recent.iloc[[-1]][X_cols]
+pred_ret = float(model.predict(latest_row)[0])
+live_close = float(reg["Close"].iloc[-1])
+pred_price = live_close * (1 + pred_ret)
 
 def signal_from_ret(r):
     if r >= 0.004:
@@ -183,37 +164,28 @@ def signal_from_ret(r):
     else:
         return "🔴 Strong Sell"
 
+signal = signal_from_ret(pred_ret)
+color = "green" if "Buy" in signal else "red" if "Sell" in signal else "gray"
+
 st.subheader(f"Live 10-Minute Forecast • {ticker}")
 c1, c2, c3 = st.columns(3)
-signal_box = st.empty()
+c1.metric("Last Price", f"${live_close:.2f}")
+c2.metric("Predicted 10-min Return", f"{pred_ret:+.3%}")
+c3.metric("Implied Price in ~10 min", f"${pred_price:.2f}")
 
-try:
-    # Always get the latest live quote, not last close
-    live_close = get_live_price(ticker)
-    if np.isnan(live_close):
-        raise ValueError("Live price unavailable.")
+st.markdown(f"<h3 style='color:{color}'>{signal}</h3>", unsafe_allow_html=True)
+st.caption(f"Auto-refreshes every {refresh_secs} seconds — ticker stays saved.")
 
-    # Update last row’s Close in dataset to reflect real-time price
-    latest_df = reg.copy()
-    latest_df.iloc[-1, latest_df.columns.get_loc("Close")] = live_close
-
-    # Recalculate features with this live price
-    fx_live = make_minute_features(latest_df).iloc[[-1]]
-    fx_live["sentiment"] = 0.0
-    fx_live = fx_live[X_cols].fillna(method="ffill").fillna(0)
-
-    pred_ret = float(model.predict(fx_live)[0])
-    pred_price = live_close * (1 + pred_ret)
-
-    signal = signal_from_ret(pred_ret)
-    color = "green" if "Buy" in signal else "red" if "Sell" in signal else "gray"
-
-    c1.metric("Live Price", f"${live_close:.2f}")
-    c2.metric("Predicted 10-min Return", f"{pred_ret:+.3%}")
-    c3.metric("Implied Price in ~10 min", f"${pred_price:.2f}")
-    signal_box.markdown(f"<h3 style='color:{color}'>{signal}</h3>", unsafe_allow_html=True)
-
-except Exception as e:
-    signal_box.error(f"⚠️ Live update error: {e}")
-
-st.caption("⚡ Uses *live quote* (not last close) for predictions — updates every 15s.")
+# ---------- Simple Backtest ----------
+with st.expander("Show simple walk-forward backtest (last session)"):
+    last_day = fx_recent.index.date[-1]
+    mask = pd.Series(fx_recent.index.date == last_day, index=fx_recent.index)
+    day_fx = fx_recent[mask]
+    if len(day_fx) > 100:
+        preds = model.predict(day_fx[X_cols])
+        df_bt = pd.DataFrame({"ret_fwd": day_fx["target"].values, "pred": preds}, index=day_fx.index)
+        pnl = np.sign(df_bt["pred"]) * df_bt["ret_fwd"]
+        st.metric("Naive sign-strategy total return", f"{pnl.sum():+.3%}")
+        st.line_chart(df_bt[["pred","ret_fwd"]])
+    else:
+        st.write("Not enough bars for backtest.")
