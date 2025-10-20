@@ -64,9 +64,8 @@ def in_market_hours(ts, tz="America/New_York"):
     return (local.weekday() < 5) and (hour >= 9.5) and (hour <= 16)
 
 def market_open_now():
-    ny = datetime.now(pytz.timezone("America/New_York"))
-    return ny.weekday() < 5 and (ny.time().hour > 9 or (ny.time().hour == 9 and ny.time().minute >= 30)) and ny.time().hour < 16
-
+    return True
+    
 # ---------- Download data ----------
 st.write(f"⬇️ Downloading 1-minute data for **{ticker}** (last 5 days)…")
 try:
