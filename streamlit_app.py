@@ -36,14 +36,18 @@ with st.expander("Advanced"):
     random_state = st.number_input("Random state", min_value=0, value=42, step=1)
 
 # ---------- Helper Functions ----------
-def rsi(series, window=14):
-    delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    roll_up = up.ewm(alpha=1/window, adjust=False).mean()
-    roll_down = down.ewm(alpha=1/window, adjust=False).mean()
-    rs = roll_up / roll_down.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+# ---------- Helper Functions ----------
+
+def tom(series, window=9):
+    """
+    Typical Oscillator Momentum (TOM)
+    TOM = 100 * (Close - min(Close, window)) / (max(Close, window) - min(Close, window))
+    Similar to a normalized momentum oscillator (range 0–100).
+    """
+    roll_min = series.rolling(window=window).min()
+    roll_max = series.rolling(window=window).max()
+    tom_val = 100 * (series - roll_min) / (roll_max - roll_min)
+    return tom_val.fillna(50)  # neutral midpoint
 
 def make_minute_features(df):
     out = df.copy()
@@ -53,8 +57,8 @@ def make_minute_features(df):
     out["hl_spread"] = (out["High"] - out["Low"]) / out["Close"]
     out["vol_10"] = out["ret_1"].rolling(10).std()
     out["vol_30"] = out["ret_1"].rolling(30).std()
-    out["rsi_14"] = rsi(out["Close"], 14)
-    for col in ["ret_1","ret_5","ret_10","vol_10","vol_30","rsi_14","hl_spread"]:
+    out["tom_9"]  = tom(out["Close"], 9)  # ⬅️ replace RSI with TOM(9)
+    for col in ["ret_1","ret_5","ret_10","vol_10","vol_30","tom_9","hl_spread"]:
         out[f"{col}_lag1"]  = out[col].shift(1)
         out[f"{col}_lag5"]  = out[col].shift(5)
         out[f"{col}_lag10"] = out[col].shift(10)
