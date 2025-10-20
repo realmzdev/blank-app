@@ -5,17 +5,11 @@ from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error
 from transformers import pipeline
 import torch
-import time
+from streamlit_autorefresh import st_autorefresh
 
 warnings.filterwarnings("ignore")
 
-# === Auto update every 10s without page reload ===
-if "last_update" not in st.session_state:
-    st.session_state["last_update"] = 0
-now = time.time()
-if now - st.session_state["last_update"] > 10:
-    st.session_state["last_update"] = now
-    st.rerun()
+
 
 # ---------- Streamlit UI ----------
 st.set_page_config(page_title="Real-Time 10-Minute Stock Forecast", layout="centered")
@@ -156,6 +150,8 @@ latest_row = fx_recent.iloc[[-1]][X_cols]
 pred_ret = float(model.predict(latest_row)[0])
 live_close = float(reg["Close"].iloc[-1])
 pred_price = live_close * (1 + pred_ret)
+
+st_autorefresh(interval=10 * 1000, key="forecast_refresh")
 
 def signal_from_ret(r):
     if r >= 0.004:
