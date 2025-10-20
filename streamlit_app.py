@@ -75,7 +75,7 @@ def market_open_now():
     now_time = ny.time()
     if weekday >= 5:
         return False
-    return dtime(9,30) <= now_time <= dtime(16,0)
+    return True
 
 @st.cache_resource(show_spinner=False)
 def get_sentiment_model():
