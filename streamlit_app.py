@@ -1,23 +1,19 @@
-import warnings, numpy as np, pandas as pd, yfinance as yf, time, pytz
+# streamlit run tom_live_forecast.py
+import warnings, numpy as np, pandas as pd, yfinance as yf, pytz
 import streamlit as st
-from datetime import datetime, time as dtime
+from datetime import datetime
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error
 from streamlit_autorefresh import st_autorefresh
-
-# Safe import for transformers pipeline
-try:
-    from transformers import pipeline
-except ImportError:
-    from transformers.pipelines import pipeline
 import torch
+from transformers import pipeline
 
 warnings.filterwarnings("ignore")
 st.set_page_config(page_title="Real-Time 10-Minute Stock Forecast", layout="centered")
 st.title("⏱️ Real-Time Stock Forecast")
-st.caption("Predicts next return using intraday (1-min) data. Not financial advice.")
+st.caption("Predicts next 10–15 minute return using intraday 1-min data + TOM(9). Not financial advice.")
 
-# ---------- Persistent Ticker ----------
+# ---------- Persistent ticker ----------
 if "ticker" not in st.session_state:
     st.session_state["ticker"] = "AAPL"
 
@@ -35,19 +31,13 @@ with st.expander("Advanced"):
     use_sentiment = st.checkbox("Use FinBERT sentiment (slower)", value=False)
     random_state = st.number_input("Random state", min_value=0, value=42, step=1)
 
-# ---------- Helper Functions ----------
-# ---------- Helper Functions ----------
-
+# ---------- Helper functions ----------
 def tom(series, window=9):
-    """
-    Typical Oscillator Momentum (TOM)
-    TOM = 100 * (Close - min(Close, window)) / (max(Close, window) - min(Close, window))
-    Similar to a normalized momentum oscillator (range 0–100).
-    """
+    """Typical Oscillator Momentum"""
     roll_min = series.rolling(window=window).min()
     roll_max = series.rolling(window=window).max()
     tom_val = 100 * (series - roll_min) / (roll_max - roll_min)
-    return tom_val.fillna(50)  # neutral midpoint
+    return tom_val.fillna(50)
 
 def make_minute_features(df):
     out = df.copy()
@@ -57,7 +47,7 @@ def make_minute_features(df):
     out["hl_spread"] = (out["High"] - out["Low"]) / out["Close"]
     out["vol_10"] = out["ret_1"].rolling(10).std()
     out["vol_30"] = out["ret_1"].rolling(30).std()
-    out["tom_9"]  = tom(out["Close"], 9)  # ⬅️ replace RSI with TOM(9)
+    out["tom_9"]  = tom(out["Close"], 9)
     for col in ["ret_1","ret_5","ret_10","vol_10","vol_30","tom_9","hl_spread"]:
         out[f"{col}_lag1"]  = out[col].shift(1)
         out[f"{col}_lag5"]  = out[col].shift(5)
@@ -70,24 +60,15 @@ def make_minute_features(df):
 
 def in_market_hours(ts, tz="America/New_York"):
     local = ts.tz_convert(tz)
-    hour = local.hour + local.minute/60.0
-    return (local.weekday() < 5) and (hour >= 9.5) and (hour <= 16.0)
+    hour = local.hour + local.minute / 60
+    return (local.weekday() < 5) and (hour >= 9.5) and (hour <= 16)
 
 def market_open_now():
     ny = datetime.now(pytz.timezone("America/New_York"))
-    weekday = ny.weekday()
-    now_time = ny.time()
-    if weekday >= 5:
-        return False
-    return True
+    return ny.weekday() < 5 and (ny.time().hour > 9 or (ny.time().hour == 9 and ny.time().minute >= 30)) and ny.time().hour < 16
 
-@st.cache_resource(show_spinner=False)
-def get_sentiment_model():
-    device = 0 if torch.cuda.is_available() else -1
-    return pipeline("sentiment-analysis", model="ProsusAI/finbert", device=device)
-
-# ---------- Data Download ----------
-st.write(f"⬇️ Downloading 1-minute data for **{ticker}** (last 7 days)…")
+# ---------- Download data ----------
+st.write(f"⬇️ Downloading 1-minute data for **{ticker}** (last 5 days)…")
 try:
     data = yf.download(
         tickers=ticker,
@@ -102,36 +83,29 @@ except Exception as e:
     st.stop()
 
 if data.empty:
-    st.error("No intraday data returned. Try a different symbol or later.")
+    st.error("No intraday data returned.")
     st.stop()
 
-data = data.dropna().copy()
 data.index = data.index.tz_localize("UTC") if data.index.tz is None else data.index.tz_convert("UTC")
-
 reg = data[data.index.map(in_market_hours)]
 if len(reg) < 500:
-    st.info("Little regular-hours data; using all data (incl. pre/post).")
     reg = data
 
-# ---------- Feature Engineering ----------
+# ---------- Feature engineering ----------
 h = int(target_horizon_min)
-reg["future_ret_h"] = reg["Close"].shift(-h) / reg["Close"] - 1.0
+reg["future_ret_h"] = reg["Close"].shift(-h) / reg["Close"] - 1
 cut_time = reg.index.max() - pd.Timedelta(days=int(train_days))
-fx = make_minute_features(reg).copy()
+fx = make_minute_features(reg)
 fx["target"] = reg["future_ret_h"]
 fx = fx.dropna()
-fx_recent = fx[fx.index >= cut_time].copy()
+fx_recent = fx[fx.index >= cut_time]
 if fx_recent.empty:
     st.error("Not enough data for training.")
     st.stop()
 
-if use_sentiment:
-    st.write("🧠 Using FinBERT sentiment (placeholder score = 0)")
-    fx_recent["sentiment"] = 0.0
-else:
-    fx_recent["sentiment"] = 0.0
+fx_recent["sentiment"] = 0.0
 
-# ---------- Model Training ----------
+# ---------- Train model ----------
 split_idx = int(len(fx_recent) * 0.8)
 X_cols = [c for c in fx_recent.columns if c not in ["Open","High","Low","Close","Adj Close","Volume","target","future_ret_h"]]
 X_train = fx_recent[X_cols].iloc[:split_idx]
@@ -141,15 +115,15 @@ y_valid = fx_recent["target"].iloc[split_idx:]
 
 st.write("🤖 Training Gradient Boosting model…")
 model = GradientBoostingRegressor(
-    n_estimators=800,        # enough trees for smooth fit
-    learning_rate=0.02,      # small step size → less noise
-    max_depth=3,             # shallow trees generalize better intraday
-    min_samples_split=40,    # avoid fitting on tiny micro patterns
-    min_samples_leaf=15,     # stabilize predictions
-    subsample=0.85,          # stochastic gradient boosting (reduces variance)
-    max_features="sqrt",     # random feature selection per split
+    n_estimators=800,
+    learning_rate=0.02,
+    max_depth=3,
+    min_samples_split=40,
+    min_samples_leaf=15,
+    subsample=0.85,
+    max_features="sqrt",
     random_state=int(random_state),
-    loss="huber",            # robust to outliers in price moves
+    loss="huber",
 )
 model.fit(X_train, y_train)
 
@@ -157,54 +131,45 @@ if len(X_valid) >= 50:
     valid_pred = model.predict(X_valid)
     mae = mean_absolute_error(y_valid, valid_pred)
     st.metric("Validation MAE (10-min return)", f"{mae:.5f}")
-else:
-    st.caption("Validation window too small.")
 
-# ---------- Live Forecast (auto-updating every 15s) ----------
-# reruns script (not reloads page) every 15 seconds
-st_autorefresh(interval=10 * 1000, key="forecast_refresh")
+# ---------- Live forecast (updates every 15 s) ----------
+st_autorefresh(interval=15 * 1000, key="forecast_refresh")
 
 def signal_from_ret(r):
-    if r >= 0.004:
-        return "🟩 Strong Buy"
-    elif r >= 0.001:
-        return "🟢 Buy"
-    elif r > -0.001:
-        return "⚪ Neutral"
-    elif r > -0.004:
-        return "🔻 Sell"
-    else:
-        return "🔴 Strong Sell"
+    if r >= 0.004: return "🟩 Strong Buy"
+    elif r >= 0.001: return "🟢 Buy"
+    elif r > -0.001: return "⚪ Neutral"
+    elif r > -0.004: return "🔻 Sell"
+    else: return "🔴 Strong Sell"
 
 st.subheader(f"Live Forecast • {ticker}")
 c1, c2, c3 = st.columns(3)
 signal_box = st.empty()
 
 if not market_open_now():
-    signal_box.info("⏸ Market closed — updates paused until open.")
+    signal_box.info("⏸ Market closed — updates paused.")
 else:
     try:
         tk = yf.Ticker(ticker)
+        # --- use the actual current quote if available ---
         live_info = getattr(tk, "fast_info", None)
         if live_info and getattr(live_info, "last_price", None):
-            live_close = float(live_info.last_price)
+            live_price = float(live_info.last_price)
         else:
             live_data = tk.history(period="1d", interval="1m", auto_adjust=True)
-            live_close = float(live_data["Close"].iloc[-1]) if not live_data.empty else np.nan
+            live_price = float(live_data["Close"].iloc[-1]) if not live_data.empty else np.nan
 
-        latest_row = fx_recent.iloc[[-1]][X_cols]
-        pred_ret = float(model.predict(latest_row)[0])
-        pred_price = live_close * (1 + pred_ret)
-
+        latest_X = fx_recent.iloc[[-1]][X_cols]
+        pred_ret = float(model.predict(latest_X)[0])
+        pred_price = live_price * (1 + pred_ret)
         signal = signal_from_ret(pred_ret)
         color = "green" if "Buy" in signal else "red" if "Sell" in signal else "gray"
 
-        c1.metric("Last Price", f"${live_close:.2f}")
-        c2.metric("Predicted Return", f"{pred_ret:+.3%}")
+        c1.metric("Live Price", f"${live_price:.2f}")
+        c2.metric("Predicted Return (≈10 min)", f"{pred_ret:+.3%}")
         c3.metric("Implied Price", f"${pred_price:.2f}")
         signal_box.markdown(f"<h3 style='color:{color}'>{signal}</h3>", unsafe_allow_html=True)
-
     except Exception as e:
         signal_box.error(f"⚠️ Live update error: {e}")
 
-st.caption("⚡ Auto-updates forecast every 15 seconds without page reload.")
+st.caption("⚡ Auto-updates every 15 seconds — TOM(9) feature + live price feed.")
