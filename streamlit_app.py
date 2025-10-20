@@ -1,11 +1,12 @@
-# streamlit run intraday_10m_forecast.py
+# intraday_10m_forecast.py
+# Run with: streamlit run intraday_10m_forecast.py
+
 import warnings, numpy as np, pandas as pd, yfinance as yf, time, pytz
 import streamlit as st
-from datetime import datetime, time as dtime
+from datetime import datetime
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error
 
-# Safe import for transformers pipeline
 try:
     from transformers import pipeline
 except ImportError:
@@ -64,13 +65,37 @@ def make_minute_features(df):
     out["dow"]    = idx.dayofweek
     return out
 
-def in_market_hours(ts, tz="America/New_York"):
-    local = ts.tz_convert(tz)
-    hour = local.hour + local.minute/60.0
-    return (local.weekday() < 5) and (hour >= 9.5) and (hour <= 16.0)
+def get_live_price(ticker):
+    """Try multiple methods to get a true live price from Yahoo."""
+    tk = yf.Ticker(ticker)
+    # Try fast_info first
+    try:
+        fi = tk.fast_info
+        if hasattr(fi, "last_price") and fi.last_price:
+            return float(fi.last_price)
+        if hasattr(fi, "regularMarketPrice") and fi.regularMarketPrice:
+            return float(fi.regularMarketPrice)
+    except Exception:
+        pass
 
-def market_open_now():
-    return True
+    # Try .info as fallback
+    try:
+        info = tk.info
+        for key in ["regularMarketPrice", "currentPrice", "bid", "ask"]:
+            if key in info and info[key] is not None and info[key] > 0:
+                return float(info[key])
+    except Exception:
+        pass
+
+    # Last resort: last 1m bar
+    try:
+        hist = tk.history(period="1d", interval="1m", auto_adjust=True)
+        if not hist.empty:
+            return float(hist["Close"].iloc[-1])
+    except Exception:
+        pass
+
+    return np.nan
 
 @st.cache_resource(show_spinner=False)
 def get_sentiment_model():
@@ -99,12 +124,7 @@ if data.empty:
 data = data.dropna().copy()
 data.index = data.index.tz_localize("UTC") if data.index.tz is None else data.index.tz_convert("UTC")
 
-reg = data[data.index.map(in_market_hours)]
-if len(reg) < 500:
-    st.info("Little regular-hours data; using all data (incl. pre/post).")
-    reg = data
-
-# ---------- Feature Engineering ----------
+reg = data.copy()
 h = int(target_horizon_min)
 reg["future_ret_h"] = reg["Close"].shift(-h) / reg["Close"] - 1.0
 cut_time = reg.index.max() - pd.Timedelta(days=int(train_days))
@@ -149,8 +169,6 @@ else:
 
 # ---------- Live Forecast (auto-updating every 15s) ----------
 from streamlit_autorefresh import st_autorefresh
-
-# reruns script (not reloads page) every 15 seconds
 st_autorefresh(interval=15 * 1000, key="forecast_refresh")
 
 def signal_from_ret(r):
@@ -169,31 +187,33 @@ st.subheader(f"Live 10-Minute Forecast • {ticker}")
 c1, c2, c3 = st.columns(3)
 signal_box = st.empty()
 
-if not market_open_now():
-    signal_box.info("⏸ Market closed — updates paused until open.")
-else:
-    try:
-        tk = yf.Ticker(ticker)
-        live_info = getattr(tk, "fast_info", None)
-        if live_info and getattr(live_info, "last_price", None):
-            live_close = float(live_info.last_price)
-        else:
-            live_data = tk.history(period="1d", interval="1m", auto_adjust=True)
-            live_close = float(live_data["Close"].iloc[-1]) if not live_data.empty else np.nan
+try:
+    # Always get the latest live quote, not last close
+    live_close = get_live_price(ticker)
+    if np.isnan(live_close):
+        raise ValueError("Live price unavailable.")
 
-        latest_row = fx_recent.iloc[[-1]][X_cols]
-        pred_ret = float(model.predict(latest_row)[0])
-        pred_price = live_close * (1 + pred_ret)
+    # Update last row’s Close in dataset to reflect real-time price
+    latest_df = reg.copy()
+    latest_df.iloc[-1, latest_df.columns.get_loc("Close")] = live_close
 
-        signal = signal_from_ret(pred_ret)
-        color = "green" if "Buy" in signal else "red" if "Sell" in signal else "gray"
+    # Recalculate features with this live price
+    fx_live = make_minute_features(latest_df).iloc[[-1]]
+    fx_live["sentiment"] = 0.0
+    fx_live = fx_live[X_cols].fillna(method="ffill").fillna(0)
 
-        c1.metric("Last Price", f"${live_close:.2f}")
-        c2.metric("Predicted 10-min Return", f"{pred_ret:+.3%}")
-        c3.metric("Implied Price in ~10 min", f"${pred_price:.2f}")
-        signal_box.markdown(f"<h3 style='color:{color}'>{signal}</h3>", unsafe_allow_html=True)
+    pred_ret = float(model.predict(fx_live)[0])
+    pred_price = live_close * (1 + pred_ret)
 
-    except Exception as e:
-        signal_box.error(f"⚠️ Live update error: {e}")
+    signal = signal_from_ret(pred_ret)
+    color = "green" if "Buy" in signal else "red" if "Sell" in signal else "gray"
 
-st.caption("⚡ Auto-updates forecast every 15 seconds without page relo")
+    c1.metric("Live Price", f"${live_close:.2f}")
+    c2.metric("Predicted 10-min Return", f"{pred_ret:+.3%}")
+    c3.metric("Implied Price in ~10 min", f"${pred_price:.2f}")
+    signal_box.markdown(f"<h3 style='color:{color}'>{signal}</h3>", unsafe_allow_html=True)
+
+except Exception as e:
+    signal_box.error(f"⚠️ Live update error: {e}")
+
+st.caption("⚡ Uses *live quote* (not last close) for predictions — updates every 15s.")
