@@ -196,4 +196,4 @@ else:
     except Exception as e:
         signal_box.error(f"⚠️ Live update error: {e}")
 
-st.caption("⚡ Auto-updates forecast every 15 seconds without page relo
+st.caption("⚡ Auto-updates forecast every 15 seconds without page relo")
