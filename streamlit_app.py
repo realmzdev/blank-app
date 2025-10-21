@@ -1,204 +1,163 @@
-import warnings, numpy as np, pandas as pd, yfinance as yf, time, pytz
+# Run it with:
+# streamlit run intraday_live_signal.py
+
+import warnings, numpy as np, pandas as pd, yfinance as yf
 import streamlit as st
-from datetime import datetime, time as dtime
-from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.metrics import mean_absolute_error
+from lightgbm import LGBMClassifier, early_stopping, log_evaluation
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+import pandas_ta as ta
 from streamlit_autorefresh import st_autorefresh
 
-# Safe import for transformers pipeline
-try:
-    from transformers import pipeline
-except ImportError:
-    from transformers.pipelines import pipeline
-import torch
-
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="Real-Time 10-Minute Stock Forecast", layout="centered")
-st.title("⏱️ Real-Time Stock Forecast")
-st.caption("Predicts next return using intraday (1-min) data. Not financial advice.")
 
-# ---------- Persistent Ticker ----------
-if "ticker" not in st.session_state:
-    st.session_state["ticker"] = "AAPL"
+# ---------------- PAGE CONFIG ----------------
+st.set_page_config(page_title="📈 Live Intraday Signal", layout="centered")
+st.title("⚡ Real-Time Intraday BUY / SELL Signal (LightGBM)")
+st.caption("Predicts next-minute move from 1-min data. Not financial advice.")
 
-col1, col2, col3 = st.columns(3)
-ticker_input = col1.text_input("Symbol", st.session_state["ticker"]).upper().strip()
-if ticker_input and ticker_input != st.session_state["ticker"]:
-    st.session_state["ticker"] = ticker_input
-ticker = st.session_state["ticker"]
+# ---------------- SIDEBAR INPUTS ----------------
+col1, col2 = st.columns(2)
+ticker = col1.text_input("Symbol", "AAPL").upper().strip()
+train_days = col2.slider("Training window (days)", 1, 5, 3)
+refresh_secs = st.number_input("Auto-refresh (seconds)", 30, 300, 60, 10)
 
-train_days = col2.slider("Training window (days of 1-min bars)", 1, 5, 3)
-target_horizon_min = col3.number_input("Forecast horizon (minutes)", min_value=5, max_value=30, value=10, step=5)
+# Auto-refresh app
+st_autorefresh(interval=refresh_secs * 1000, key="refresh_key")
 
-with st.expander("Advanced"):
-    use_prepost = st.checkbox("Include pre/post market", value=False)
-    use_sentiment = st.checkbox("Use FinBERT sentiment (slower)", value=False)
-    random_state = st.number_input("Random state", min_value=0, value=42, step=1)
+# ---------------- FEATURE FUNCTION ----------------
+def make_features(df):
+    f = pd.DataFrame(index=df.index)
+    f["log_return"] = np.log(df["Close"] / df["Close"].shift(1))
+    f["FISHER"] = ta.fisher(df["High"].squeeze(), df["Low"].squeeze(), 9)["FISHERT_9_1"]
+    f["RSI_3"] = ta.rsi(df["Close"].squeeze(), 3)
+    f["SQUEEZE"] = ta.squeeze(
+        df["High"].squeeze(), df["Low"].squeeze(), df["Close"].squeeze()
+    )["SQZ_20_2.0_20_1.5"]
+    f["ER"] = ta.er(df["Close"].squeeze(), 10)
+    vol_mean = df["Volume"].rolling(10).mean()
+    vol_std = df["Volume"].rolling(10).std()
+    f["volume_zscore"] = (df["Volume"] - vol_mean) / (vol_std + 1e-6)
+    f["vol_price_interaction"] = f["volume_zscore"] * f["log_return"]
+    f["vol_jump"] = f["log_return"].rolling(3).std() / (
+        f["log_return"].rolling(6).std() + 1e-6
+    )
+    for lag in [1, 2, 3]:
+        f[f"log_return_lag{lag}"] = f["log_return"].shift(lag)
+    ema_fast = df["Close"].ewm(span=5).mean()
+    ema_slow = df["Close"].ewm(span=15).mean()
+    f["ema_angle"] = np.arctan((ema_fast - ema_slow) / ema_slow)
+    high_10 = df["High"].rolling(10).max()
+    low_10 = df["Low"].rolling(10).min()
+    f["price_pos_10"] = (df["Close"] - low_10) / (high_10 - low_10 + 1e-6)
+    return f.dropna()
 
-# ---------- Helper Functions ----------
-
-def tom(series, window=9):
-    """Typical Oscillator Momentum (TOM) = normalized price position in rolling range."""
-    roll_min = series.rolling(window=window).min()
-    roll_max = series.rolling(window=window).max()
-    tom_val = 100 * (series - roll_min) / (roll_max - roll_min)
-    return tom_val.fillna(50)
-
-def make_minute_features(df):
-    out = df.copy()
-    out["ret_1"]  = out["Close"].pct_change(1)
-    out["ret_5"]  = out["Close"].pct_change(5)
-    out["ret_10"] = out["Close"].pct_change(10)
-    out["hl_spread"] = (out["High"] - out["Low"]) / out["Close"]
-    out["vol_10"] = out["ret_1"].rolling(10).std()
-    out["vol_30"] = out["ret_1"].rolling(30).std()
-    out["tom_9"]  = tom(out["Close"], 9)  # ⬅️ replaced RSI with TOM(9)
-    for col in ["ret_1","ret_5","ret_10","vol_10","vol_30","tom_9","hl_spread"]:
-        out[f"{col}_lag1"]  = out[col].shift(1)
-        out[f"{col}_lag5"]  = out[col].shift(5)
-        out[f"{col}_lag10"] = out[col].shift(10)
-    idx = out.index
-    out["minute"] = idx.minute
-    out["hour"]   = idx.hour
-    out["dow"]    = idx.dayofweek
-    return out
-
-def in_market_hours(ts, tz="America/New_York"):
-    local = ts.tz_convert(tz)
-    hour = local.hour + local.minute/60.0
-    return (local.weekday() < 5) and (hour >= 9.5) and (hour <= 16.0)
-
-def market_open_now():
-    ny = datetime.now(pytz.timezone("America/New_York"))
-    weekday = ny.weekday()
-    now_time = ny.time()
-    if weekday >= 5:
-        return False
-    return True
-
-@st.cache_resource(show_spinner=False)
-def get_sentiment_model():
-    device = 0 if torch.cuda.is_available() else -1
-    return pipeline("sentiment-analysis", model="ProsusAI/finbert", device=device)
-
-# ---------- Data Download ----------
-st.write(f"⬇️ Downloading 1-minute data for **{ticker}** (last 7 days)…")
+# ---------------- DATA DOWNLOAD ----------------
+st.write(f"⬇️ Downloading 1-minute data for **{ticker}** …")
 try:
-    data = yf.download(
+    df = yf.download(
         tickers=ticker,
-        period="5d",
+        period=f"{train_days}d",
         interval="1m",
+        prepost=True,
         auto_adjust=True,
-        prepost=use_prepost,
-        progress=False
+        progress=False,
     )
 except Exception as e:
     st.error(f"Error downloading data: {e}")
     st.stop()
 
-if data.empty:
+if df.empty:
     st.error("No intraday data returned. Try a different symbol or later.")
     st.stop()
 
-data = data.dropna().copy()
-data.index = data.index.tz_localize("UTC") if data.index.tz is None else data.index.tz_convert("UTC")
+# ---------------- FEATURE ENGINEERING ----------------
+f = make_features(df)
+future_close = df["Close"].shift(-3)  # predict ~3 bars ahead
+y = (future_close.loc[f.index] > df["Close"].loc[f.index]).astype(int)
+X = f.values
+y = y.values.ravel()
+split = int(len(X) * 0.8)
+X_train, X_val = X[:split], X[split:]
+y_train, y_val = y[:split], y[split:]
 
-reg = data[data.index.map(in_market_hours)]
-if len(reg) < 500:
-    st.info("Little regular-hours data; using all data (incl. pre/post).")
-    reg = data
-
-# ---------- Feature Engineering ----------
-h = int(target_horizon_min)
-reg["future_ret_h"] = reg["Close"].shift(-h) / reg["Close"] - 1.0
-cut_time = reg.index.max() - pd.Timedelta(days=int(train_days))
-fx = make_minute_features(reg).copy()
-fx["target"] = reg["future_ret_h"]
-fx = fx.dropna()
-fx_recent = fx[fx.index >= cut_time].copy()
-if fx_recent.empty:
-    st.error("Not enough data for training.")
-    st.stop()
-
-if use_sentiment:
-    st.write("🧠 Using FinBERT sentiment (placeholder score = 0)")
-    fx_recent["sentiment"] = 0.0
-else:
-    fx_recent["sentiment"] = 0.0
-
-# ---------- Model Training ----------
-split_idx = int(len(fx_recent) * 0.8)
-X_cols = [c for c in fx_recent.columns if c not in ["Open","High","Low","Close","Adj Close","Volume","target","future_ret_h"]]
-X_train = fx_recent[X_cols].iloc[:split_idx]
-y_train = fx_recent["target"].iloc[:split_idx]
-X_valid = fx_recent[X_cols].iloc[split_idx:]
-y_valid = fx_recent["target"].iloc[split_idx:]
-
-st.write("🤖 Training Gradient Boosting model…")
-model = GradientBoostingRegressor(
-    n_estimators=800,        # enough trees for smooth fit
-    learning_rate=0.02,      # small step size → less noise
-    max_depth=3,             # shallow trees generalize better intraday
-    min_samples_split=40,    # avoid fitting on tiny micro patterns
-    min_samples_leaf=15,     # stabilize predictions
-    subsample=0.85,          # stochastic gradient boosting (reduces variance)
-    max_features="sqrt",     # random feature selection per split
-    random_state=int(random_state),
-    loss="huber",            # robust to outliers in price moves
+# ---------------- TRAIN MODEL ----------------
+model = LGBMClassifier(
+    class_weight="balanced",
+    n_estimators=3000,
+    learning_rate=0.01,
+    num_leaves=63,
+    max_depth=7,
+    min_child_samples=40,
+    reg_lambda=3.0,
+    reg_alpha=0.5,
+    subsample=0.85,
+    colsample_bytree=0.85,
+    random_state=42,
+    n_jobs=-1,
 )
-model.fit(X_train, y_train)
 
-if len(X_valid) >= 50:
-    valid_pred = model.predict(X_valid)
-    mae = mean_absolute_error(y_valid, valid_pred)
-    st.metric("Validation MAE (10-min return)", f"{mae:.5f}")
+model.fit(
+    X_train,
+    y_train,
+    eval_set=[(X_val, y_val)],
+    callbacks=[early_stopping(100), log_evaluation(period=0)],
+)
+
+val_acc = accuracy_score(y_val, model.predict(X_val)) * 100
+
+# ---------------- LIVE PREDICTION ----------------
+tk = yf.Ticker(ticker)
+live_data = yf.download(
+    ticker, period="1d", interval="1m", prepost=True, progress=False
+)
+latest_bar = live_data.iloc[-1]
+df_live = pd.concat([df, latest_bar.to_frame().T]).drop_duplicates()
+f_live = make_features(df_live)
+latest_features = f_live.iloc[-1].values.reshape(1, -1)
+p_up = model.predict_proba(latest_features)[0, 1]
+
+# ---------------- SIGNAL LOGIC ----------------
+if p_up >= 0.75:
+    signal = "🟩 STRONG BUY"
+    color = "limegreen"
+elif p_up >= 0.65:
+    signal = "🟢 BUY"
+    color = "green"
+elif p_up <= 0.25:
+    signal = "🔴 STRONG SELL"
+    color = "red"
+elif p_up <= 0.35:
+    signal = "🔻 SELL"
+    color = "darkred"
 else:
-    st.caption("Validation window too small.")
+    signal = "⚪ HOLD"
+    color = "gray"
 
-# ---------- Live Forecast (auto-updating every 15s) ----------
-st_autorefresh(interval=10 * 1000, key="forecast_refresh")
+# ---------------- PRICE ESTIMATION ----------------
+live_price = getattr(tk, "fast_info", None)
+latest_close = float(live_price.last_price)
+recent_vol = f_live["log_return"].rolling(20).std().iloc[-1]
+expected_return = (p_up - 0.5) * 2 * recent_vol
+predicted_price = latest_close * (1 + expected_return)
 
-def signal_from_ret(r):
-    if r >= 0.004:
-        return "🟩 Strong Buy"
-    elif r >= 0.001:
-        return "🟢 Buy"
-    elif r > -0.001:
-        return "⚪ Neutral"
-    elif r > -0.004:
-        return "🔻 Sell"
-    else:
-        return "🔴 Strong Sell"
-
-st.subheader(f"Live Forecast • {ticker}")
+# ---------------- DISPLAY ----------------
+st.subheader(f"📊 {ticker} — Live Forecast")
 c1, c2, c3 = st.columns(3)
-signal_box = st.empty()
+c1.metric("Validation Accuracy", f"{val_acc:.2f}%")
+c2.metric("Probability Up", f"{p_up:.3f}")
+c3.metric("Current Price", f"${latest_close:.2f}")
 
-if not market_open_now():
-    signal_box.info("⏸ Market closed — updates paused until open.")
+st.markdown(f"<h2 style='color:{color}'>{signal}</h2>", unsafe_allow_html=True)
+st.metric("Predicted Next Price (~2-3 min ahead)", f"${predicted_price:.2f}")
+
+# ---------------- CONFIDENT-TRADE ACCURACY ----------------
+y_prob = model.predict_proba(X_val)[:, 1]
+mask = (y_prob > 0.65) | (y_prob < 0.35)
+if mask.sum() > 0:
+    acc_conf = accuracy_score(y_val[mask], (y_prob[mask] > 0.5).astype(int)) * 100
+    st.caption(f"🎯 Confident-Trade Accuracy: **{acc_conf:.2f}%**")
 else:
-    try:
-        tk = yf.Ticker(ticker)
-        live_info = getattr(tk, "fast_info", None)
-        if live_info and getattr(live_info, "last_price", None):
-            live_close = float(live_info.last_price)  # ✅ real-time price
-        else:
-            live_data = tk.history(period="1d", interval="1m", auto_adjust=True)
-            live_close = float(live_data["Close"].iloc[-1]) if not live_data.empty else np.nan
+    st.caption("No confident trades found in validation.")
 
-        latest_row = fx_recent.iloc[[-1]][X_cols]
-        pred_ret = float(model.predict(latest_row)[0])
-        pred_price = live_close * (1 + pred_ret)
-
-        signal = signal_from_ret(pred_ret)
-        color = "green" if "Buy" in signal else "red" if "Sell" in signal else "gray"
-
-        c1.metric("Last Price", f"${live_close:.2f}")
-        c2.metric("Predicted Return", f"{pred_ret:+.3%}")
-        c3.metric("Implied Price", f"${pred_price:.2f}")
-        signal_box.markdown(f"<h3 style='color:{color}'>{signal}</h3>", unsafe_allow_html=True)
-
-    except Exception as e:
-        signal_box.error(f"⚠️ Live update error: {e}")
-
-st.caption("⚡ Auto-updates forecast every 15 seconds without page reload (TOM(9) replaces RSI).")
+st.caption(f"Auto-refreshes every {refresh_secs} seconds.")
